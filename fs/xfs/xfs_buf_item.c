@@ -636,20 +636,23 @@ xfs_buf_item_unlock(
 
 	/*
 	 * Clean buffers, by definition, cannot be in the AIL. However, aborted
-	 * buffers may be dirty and hence in the AIL. Therefore if we are
-	 * aborting a buffer and we've just taken the last refernce away, we
-	 * have to check if it is in the AIL before freeing it. We need to free
-	 * it in this case, because an aborted transaction has already shut the
-	 * filesystem down and this is the last chance we will have to do so.
+	 * buffers may be in the AIL regardless of dirty state. An aborted
+	 * transaction that invalidates a buffer already in the AIL may have
+	 * marked it stale and cleared the dirty state, for example.
+	 *
+	 * Therefore if we are aborting a buffer and we've just taken the last
+	 * reference away, we have to check if it is in the AIL before freeing
+	 * it. We need to free it in this case, because an aborted transaction
+	 * has already shut the filesystem down and this is the last chance we
+	 * will have to do so.
 	 */
 	if (atomic_dec_and_test(&bip->bli_refcount)) {
-		if (clean)
-			xfs_buf_item_relse(bp);
-		else if (aborted) {
+		if (aborted) {
 			ASSERT(XFS_FORCED_SHUTDOWN(lip->li_mountp));
 			xfs_trans_ail_remove(lip, SHUTDOWN_LOG_IO_ERROR);
 			xfs_buf_item_relse(bp);
-		}
+		} else if (clean)
+			xfs_buf_item_relse(bp);
 	}
 
 	if (!(flags & XFS_BLI_HOLD))
@@ -865,7 +868,7 @@ xfs_buf_item_log_segment(
 	 */
 	if (bit) {
 		end_bit = MIN(bit + bits_to_set, (uint)NBWORD);
-		mask = ((1 << (end_bit - bit)) - 1) << bit;
+		mask = ((1U << (end_bit - bit)) - 1) << bit;
 		*wordp |= mask;
 		wordp++;
 		bits_set = end_bit - bit;
@@ -888,7 +891,7 @@ xfs_buf_item_log_segment(
 	 */
 	end_bit = bits_to_set - bits_set;
 	if (end_bit) {
-		mask = (1 << end_bit) - 1;
+		mask = (1U << end_bit) - 1;
 		*wordp |= mask;
 	}
 }
@@ -1095,7 +1098,8 @@ xfs_buf_iodone_callback_error(
 	     bp->b_last_error != bp->b_error) {
 		bp->b_flags |= (XBF_WRITE | XBF_DONE | XBF_WRITE_FAIL);
 		bp->b_last_error = bp->b_error;
-		if (cfg->retry_timeout && !bp->b_first_retry_time)
+		if (cfg->retry_timeout != XFS_ERR_RETRY_FOREVER &&
+		    !bp->b_first_retry_time)
 			bp->b_first_retry_time = jiffies;
 
 		xfs_buf_ioerror(bp, 0);
@@ -1111,7 +1115,7 @@ xfs_buf_iodone_callback_error(
 	if (cfg->max_retries != XFS_ERR_RETRY_FOREVER &&
 	    ++bp->b_retries > cfg->max_retries)
 			goto permanent_error;
-	if (cfg->retry_timeout &&
+	if (cfg->retry_timeout != XFS_ERR_RETRY_FOREVER &&
 	    time_after(jiffies, cfg->retry_timeout + bp->b_first_retry_time))
 			goto permanent_error;
 
@@ -1161,6 +1165,7 @@ xfs_buf_iodone_callbacks(
 	 */
 	bp->b_last_error = 0;
 	bp->b_retries = 0;
+	bp->b_first_retry_time = 0;
 
 	xfs_buf_do_callbacks(bp);
 	bp->b_fspriv = NULL;

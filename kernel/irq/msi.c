@@ -14,24 +14,44 @@
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
 #include <linux/msi.h>
+#include <linux/slab.h>
 
-/* Temparory solution for building, will be removed later */
-#include <linux/pci.h>
-
-struct msi_desc *alloc_msi_entry(struct device *dev)
+/**
+ * alloc_msi_entry - Allocate an initialize msi_entry
+ * @dev:	Pointer to the device for which this is allocated
+ * @nvec:	The number of vectors used in this entry
+ * @affinity:	Optional pointer to an affinity mask array size of @nvec
+ *
+ * If @affinity is not NULL then a an affinity array[@nvec] is allocated
+ * and the affinity masks from @affinity are copied.
+ */
+struct msi_desc *
+alloc_msi_entry(struct device *dev, int nvec, const struct cpumask *affinity)
 {
-	struct msi_desc *desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	struct msi_desc *desc;
+
+	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
 	if (!desc)
 		return NULL;
 
 	INIT_LIST_HEAD(&desc->list);
 	desc->dev = dev;
+	desc->nvec_used = nvec;
+	if (affinity) {
+		desc->affinity = kmemdup(affinity,
+			nvec * sizeof(*desc->affinity), GFP_KERNEL);
+		if (!desc->affinity) {
+			kfree(desc);
+			return NULL;
+		}
+	}
 
 	return desc;
 }
 
 void free_msi_entry(struct msi_desc *entry)
 {
+	kfree(entry->affinity);
 	kfree(entry);
 }
 
@@ -245,13 +265,20 @@ struct irq_domain *msi_create_irq_domain(struct fwnode_handle *fwnode,
 					 struct msi_domain_info *info,
 					 struct irq_domain *parent)
 {
+	struct irq_domain *domain;
+
 	if (info->flags & MSI_FLAG_USE_DEF_DOM_OPS)
 		msi_domain_update_dom_ops(info);
 	if (info->flags & MSI_FLAG_USE_DEF_CHIP_OPS)
 		msi_domain_update_chip_ops(info);
 
-	return irq_domain_create_hierarchy(parent, 0, 0, fwnode,
-					   &msi_domain_ops, info);
+	domain = irq_domain_create_hierarchy(parent, IRQ_DOMAIN_FLAG_MSI, 0,
+					     fwnode, &msi_domain_ops, info);
+
+	if (domain && !domain->name && info->chip)
+		domain->name = info->chip->name;
+
+	return domain;
 }
 
 int msi_domain_prepare_irqs(struct irq_domain *domain, struct device *dev,
@@ -288,7 +315,7 @@ int msi_domain_populate_irqs(struct irq_domain *domain, struct device *dev,
 
 		ops->set_desc(arg, desc);
 		/* Assumes the domain mutex is held! */
-		ret = irq_domain_alloc_irqs_recursive(domain, virq, 1, arg);
+		ret = irq_domain_alloc_irqs_hierarchy(domain, virq, 1, arg);
 		if (ret)
 			break;
 
